@@ -27,6 +27,8 @@
 #define REG_NO_ERROR    0
 #define REG_ERROR       1
 
+#define PC_REGNAME  "rip"
+
 typedef struct debug_state_t {
     int hit_bp;
 } debug_state_t;
@@ -298,13 +300,14 @@ void set_reg(char *regname, unsigned long long val, int *err) {
     }
 }
 
-void step_over_breakpoint(int *status) {
-    void *bp_addr = (void*)(get_reg("rip", NULL) - 1);
+void step_over_breakpoint(int *status, debug_state_t *state) {
+    state->hit_bp = 0;
+    void *bp_addr = (void*)(get_reg(PC_REGNAME, NULL) - 1);
     int bp_idx = get_bp_at_addr(bp_addr);
     if (bp_idx != -1) {
         disable_bp(&breakpoints[bp_idx]);
     }
-    set_reg("rip", (unsigned long long)bp_addr, NULL);
+    set_reg(PC_REGNAME, (unsigned long long)bp_addr, NULL);
     ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
     waitpid(child_pid, status, 0);
     if (bp_idx != -1) {
@@ -420,13 +423,17 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             printf("Continuing...\n");
             if (state->hit_bp) {
                 printf("Stepping over breakpoint\n");
-                step_over_breakpoint(status);
+                step_over_breakpoint(status, state);
             }
             state->hit_bp = 0;
             ptrace(PTRACE_CONT, child_pid, NULL, NULL);
             waitpid(child_pid, status, 0);
             break;
         } case CMD_NEXT: {
+            if (state->hit_bp) {
+                printf("Stepping over breakpoint\n");
+                step_over_breakpoint(status, state);
+            }
             ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
             waitpid(child_pid, status, 0);
             break;
@@ -464,6 +471,7 @@ static void attach_to_inferior(pid_t pid)
     printf("Starting on PID %d\n", pid);
     ptrace(PTRACE_SEIZE, pid, NULL, NULL);
     ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
+
     int status;
     debug_state_t state;
     state.hit_bp = 0;
@@ -473,7 +481,7 @@ static void attach_to_inferior(pid_t pid)
     while(1) {
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP || WSTOPSIG(status) == SIGINT) {
             printf("Stop sig: %d\n", WSTOPSIG(status));
-            if (get_bp_at_addr((void*)(get_reg("rip", NULL) - 1)) != -1) {
+            if (get_bp_at_addr((void*)(get_reg(PC_REGNAME, NULL) - 1)) != -1) {
                 state.hit_bp = 1;
                 printf("Stopped at breakpoint\n");
             }
@@ -497,9 +505,7 @@ static void attach_to_inferior(pid_t pid)
         } else if (WIFEXITED(status)) {
             printf("Inferior exited\n");
             exit(0);
-        } /*else {
-            printf("Unknown status %d\n", status);
-        }*/
+        }
     }
 }
 
