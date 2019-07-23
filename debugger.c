@@ -1,4 +1,4 @@
-#include "dwarf4.h"
+#include "dwarf4/dwarf4.h"
 #include <sys/ptrace.h>
 #include <unistd.h>
 #include <errno.h>
