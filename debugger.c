@@ -1,3 +1,4 @@
+#include "dwarf4.h"
 #include <sys/ptrace.h>
 #include <unistd.h>
 #include <errno.h>
@@ -45,12 +46,14 @@ typedef struct debug_state_t {
 typedef struct bp_t {
     void *addr;
     char orig_data;
+    int enabled;
     int exists;
 } bp_t;
 
 typedef enum cmd_type_t {
     CMD_BP_SET,
     CMD_BP_DEL,
+    CMD_BP_LIST,
     CMD_CONTINUE,
     CMD_NEXT,
     CMD_PRINT_MEM,
@@ -181,7 +184,7 @@ void *line_to_addr(unsigned int line) {
 }
 
 void enable_bp(bp_t *bp) {
-    if (!bp->exists) {
+    if (!bp->enabled) {
         long data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         printf("Before: %lx\n", data);
         long int3 = 0xcc;
@@ -190,17 +193,17 @@ void enable_bp(bp_t *bp) {
         ptrace(PTRACE_POKEDATA, child_pid, bp->addr, data_with_int3);
         data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         printf("After: %lx\n", data);
-        bp->exists = 1;
+        bp->enabled = 1;
     }
 }
 
 void disable_bp(bp_t *bp) {
-    if (bp->exists) {
+    if (bp->enabled) {
         long data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         long restored_data = ((data & ~0xff) | bp->orig_data);
         ptrace(PTRACE_POKEDATA, child_pid, bp->addr, restored_data);
         printf("Disabling bp at %p: instruction %lx -> %lx\n", bp->addr, data, restored_data);
-        bp->exists = 0;
+        bp->enabled = 0;
     }
 }
 
@@ -218,6 +221,7 @@ int create_bp(unsigned int line) {
         return BP_ERR_TOOMANY;
     }
     breakpoints[avail_idx].addr = line_to_addr(line);
+    breakpoints[avail_idx].exists = 1;
     enable_bp(&breakpoints[avail_idx]);
     return avail_idx;
 }
@@ -230,6 +234,14 @@ int get_bp_at_addr(void *addr) {
         }
     }
     return -1;
+}
+
+void list_breakpoints() {
+    for (int i = 0; i < MAX_N_BREAKPOINTS; i++) {
+        if (breakpoints[i].exists) {
+            printf("%d\t%p\t%d\n", i, breakpoints[i].addr, breakpoints[i].enabled);
+        }
+    }
 }
 
 unsigned long long *get_reg_in_regs(struct user_regs_struct *regs, char *reg_str) {
@@ -301,17 +313,21 @@ void set_reg(char *regname, unsigned long long val, int *err) {
     }
 }
 
+// Must be called upon any continue/step command after hitting a breakpoint,
+// even if the breakpoint was disabled already! Otherwise the instruction on
+// which the breakpoint was set will be skipped.
 void step_over_breakpoint(int *status, debug_state_t *state) {
     state->hit_bp = 0;
     void *bp_addr = (void*)(get_reg(PC_REGNAME, NULL) - 1);
     int bp_idx = get_bp_at_addr(bp_addr);
-    if (bp_idx != -1) {
+    int must_disable_bp = (bp_idx != -1 && breakpoints[bp_idx].enabled);
+    if (must_disable_bp) {
         disable_bp(&breakpoints[bp_idx]);
     }
     set_reg(PC_REGNAME, (unsigned long long)bp_addr, NULL);
     ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
     waitpid(child_pid, status, 0);
-    if (bp_idx != -1) {
+    if (must_disable_bp) {
         enable_bp(&breakpoints[bp_idx]);
     }
 }
@@ -345,6 +361,8 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
             return PARSE_ERROR;
         }
         cmd->bp_del_info.idx = idx;
+    } else if(!strcmp(cmd_tokens[0], "bl")) {
+        cmd->type = CMD_BP_LIST;
     } else if(!strcmp(cmd_tokens[0], "c")) {
         cmd->type = CMD_CONTINUE;
     } else if(!strcmp(cmd_tokens[0], "n")) {
@@ -419,6 +437,9 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             }
             disable_bp(&breakpoints[idx]);
             printf("Disabled breakpoint %d\n", idx);
+            break;
+        } case CMD_BP_LIST: {
+            list_breakpoints();
             break;
         } case CMD_CONTINUE: {
             printf("Continuing...\n");
@@ -546,6 +567,7 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < argc - 2 && i < MAX_N_CHILD_ARGS; i++) {
         child_argv[i] = argv[i + 2];
     }
+    dwarf4_init(argv[1]);
     dbg_inferior_exec(argv[1], child_argv);
 
     return MAIN_NO_ERROR;
