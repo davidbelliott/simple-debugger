@@ -13,6 +13,8 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+#define MAX_N_CHILD_ARGS 256
+
 #define MAX_N_BREAKPOINTS 256
 
 #define PARSE_MAX_N_TOKENS 16
@@ -24,8 +26,15 @@
 #define EXECUTE_NO_ERROR    0
 #define EXECUTE_ERROR       1
 
-#define REG_NO_ERROR    0
-#define REG_ERROR       1
+#define REG_NO_ERROR        0
+#define REG_ERROR_NOTFOUND  1
+
+#define MAIN_NO_ERROR       0
+#define MAIN_ERROR_ARGS     1
+
+// Breakpoint errors -- must be less than 0
+#define BP_ERR_DUPLICATE    -1
+#define BP_ERR_TOOMANY      -2
 
 #define PC_REGNAME  "rip"
 
@@ -96,7 +105,6 @@ int n_breakpoints = 0;
 debug_state_t state = { 0 };
 
 void sigint_handler(int signum) {
-    printf("Handling SIGINT on PID %d...\n", child_pid);
     ptrace(PTRACE_INTERRUPT, child_pid, NULL, NULL);
 }
 
@@ -152,21 +160,11 @@ int get_addr_of_var(const char *varname, void **addr) {
     return err;
 }
 
-/* Used for ignored arguments */
-static const pid_t ignored_pid;
-static const void *ignored_ptr;
-
-
-static const void *no_continue_signal = 0;
-
-void setup_inferior(const char *path, char *const argv[])
-{
-  //ptrace(PTRACE_TRACEME, ignored_pid, ignored_ptr, ignored_ptr);
-  execv(path, argv);
+void setup_inferior(const char *path, char *const argv[]) {
+    execv(path, argv);
 }
 
 void *rel_to_abs_addr(pid_t pid, void *addr) {
-    printf("Rel addr: %p\n", addr);
     char fname[128];
     sprintf(fname, "/proc/%d/maps", pid);
     FILE *f = fopen(fname, "r");
@@ -208,11 +206,16 @@ void disable_bp(bp_t *bp) {
 
 int create_bp(unsigned int line) {
     void *addr = line_to_addr(line);
-    int avail_idx;
-    for(avail_idx = 0; avail_idx < MAX_N_BREAKPOINTS && breakpoints[avail_idx].exists; avail_idx++) {
+    int avail_idx = -1;
+    int is_duplicate = 0;
+    for(int i = 0; i < MAX_N_BREAKPOINTS; i++) {
+        if(avail_idx == -1 && !breakpoints[i].exists)
+            avail_idx = i;
+        if(breakpoints[i].addr == addr)
+            return BP_ERR_DUPLICATE;
     }
     if(avail_idx == MAX_N_BREAKPOINTS) {
-        return -1;
+        return BP_ERR_TOOMANY;
     }
     breakpoints[avail_idx].addr = line_to_addr(line);
     enable_bp(&breakpoints[avail_idx]);
@@ -278,11 +281,10 @@ unsigned long long get_reg(char *regname, int *err) {
         if (err)
             *err = REG_NO_ERROR;
         return *reg;
-    } else {
-        if (err)
-            *err = REG_ERROR;
-        return 0;
+    } else if (err) {
+        *err = REG_ERROR_NOTFOUND;
     }
+    return 0;
 }
 
 void set_reg(char *regname, unsigned long long val, int *err) {
@@ -294,9 +296,8 @@ void set_reg(char *regname, unsigned long long val, int *err) {
         set_regs(&regs);
         if (err)
             *err = REG_NO_ERROR;
-    } else {
-        if (err)
-            *err = REG_ERROR;
+    } else if (err) {
+        *err = REG_ERROR_NOTFOUND;
     }
 }
 
@@ -350,7 +351,7 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
         cmd->type = CMD_NEXT;
     } else if(!strcmp(cmd_tokens[0], "p")) {
         cmd->type = CMD_PRINT_MEM;
-        if(n_tokens < 3) {
+        if(n_tokens < 2) {
             return PARSE_ERROR;
         }
         int addr_error = get_addr_of_var(cmd_tokens[1],
@@ -404,7 +405,7 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
     switch(cmd->type) {
         case CMD_BP_SET: {
             int bp_idx = create_bp(cmd->bp_set_info.line);
-            if (bp_idx != -1) {
+            if (bp_idx >= 0) {
                 printf("Line: %d\n", cmd->bp_set_info.line);
                 printf("Enabled breakpoint %d at %p\n", bp_idx, breakpoints[bp_idx].addr);
             } else {
@@ -438,8 +439,12 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             waitpid(child_pid, status, 0);
             break;
         } case CMD_PRINT_MEM: {
+            unsigned long data = ptrace(PTRACE_PEEKDATA, child_pid,
+                    cmd->print_mem_info.addr, NULL);
+            printf("%lx\n", data);
             break;
         } case CMD_SET_MEM: {
+            ptrace(PTRACE_POKEDATA, child_pid, cmd->set_mem_info.addr, cmd->set_mem_info.new_value);
             break;
         } case CMD_PRINT_REG: {
             int reg_err;
@@ -458,6 +463,7 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             } else {
                 printf("Error: register not found\n");
             }
+            break;
         } default: {
             break;
         }
@@ -526,11 +532,21 @@ void dbg_inferior_exec(const char *path, char *const argv[])
     } while (child_pid == -1 && errno == EAGAIN);
 }
 
-int main()
-{
-    signal(SIGINT, sigint_handler);
-    char *argv[1] = { 0 };
-    dbg_inferior_exec("./hello", argv);
+void usage(char *name) {
+    printf("Usage: %s [program] [program_args]\n", name);
+}
 
-    return 0;
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        usage(argv[0]);
+        return MAIN_ERROR_ARGS;
+    }
+    signal(SIGINT, sigint_handler);
+    char *child_argv[MAX_N_CHILD_ARGS + 1] = { 0 }; // null-terminated
+    for (int i = 0; i < argc - 2 && i < MAX_N_CHILD_ARGS; i++) {
+        child_argv[i] = argv[i + 2];
+    }
+    dbg_inferior_exec(argv[1], child_argv);
+
+    return MAIN_NO_ERROR;
 }
