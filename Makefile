@@ -1,7 +1,7 @@
 CC=gcc
 CXX=g++
-CCFLAGS=-Wall
-LDFLAGS=-lreadline
+CCFLAGS=-Wall -g
+LDFLAGS=-lreadline -g
 SOURCES=$(wildcard *.c)
 OBJECTS=$(SOURCES:.c=.o)
 LIBS=dwarf4/libdwarf4.a

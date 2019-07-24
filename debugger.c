@@ -45,8 +45,7 @@ typedef struct debug_state_t {
 
 typedef struct bp_t {
     void *addr;
-    char orig_data;
-    int enabled;
+    unsigned char orig_data;
     int exists;
 } bp_t;
 
@@ -103,7 +102,7 @@ typedef struct cmd_t {
 
 
 pid_t child_pid = 0;
-bp_t breakpoints[MAX_N_BREAKPOINTS] = { 0 };
+bp_t breakpoints[MAX_N_BREAKPOINTS] = {{ 0 }};
 int n_breakpoints = 0;
 debug_state_t state = { 0 };
 
@@ -164,6 +163,7 @@ int get_addr_of_var(const char *varname, void **addr) {
 }
 
 void setup_inferior(const char *path, char *const argv[]) {
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
     execv(path, argv);
 }
 
@@ -175,35 +175,38 @@ void *rel_to_abs_addr(pid_t pid, void *addr) {
     char offset_str[13];
     fscanf(f, "%12s", offset_str);
     long offset = strtol(offset_str, NULL, 16);
+    printf("Offset: %lx\n", offset);
     return (void*)(addr + offset);
 }
 
 void *line_to_addr(unsigned int line) {
-    unsigned long long line_l = (unsigned long long)line;
-    return rel_to_abs_addr(child_pid, (void*)line_l);
+    void *addr;
+    dwarf4_query_line("hello.c", line, &addr);
+    printf("Addr: %p\n", addr);
+    return rel_to_abs_addr(child_pid, addr);
 }
 
 void enable_bp(bp_t *bp) {
-    if (!bp->enabled) {
-        long data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
+    if (!bp->exists) {
+        unsigned long data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         printf("Before: %lx\n", data);
-        long int3 = 0xcc;
-        long data_with_int3 = ((data & ~0xff) | int3);
+        unsigned long int3 = 0xcc;
+        unsigned long data_with_int3 = ((data & ~0xff) | int3);
         bp->orig_data = data & 0xff;
         ptrace(PTRACE_POKEDATA, child_pid, bp->addr, data_with_int3);
         data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         printf("After: %lx\n", data);
-        bp->enabled = 1;
+        bp->exists = 1;
     }
 }
 
 void disable_bp(bp_t *bp) {
-    if (bp->enabled) {
+    if (bp->exists) {
         long data = ptrace(PTRACE_PEEKDATA, child_pid, bp->addr, NULL);
         long restored_data = ((data & ~0xff) | bp->orig_data);
         ptrace(PTRACE_POKEDATA, child_pid, bp->addr, restored_data);
         printf("Disabling bp at %p: instruction %lx -> %lx\n", bp->addr, data, restored_data);
-        bp->enabled = 0;
+        bp->exists = 0;
     }
 }
 
@@ -214,14 +217,13 @@ int create_bp(unsigned int line) {
     for(int i = 0; i < MAX_N_BREAKPOINTS; i++) {
         if(avail_idx == -1 && !breakpoints[i].exists)
             avail_idx = i;
-        if(breakpoints[i].addr == addr)
+        if(breakpoints[i].exists && breakpoints[i].addr == addr)
             return BP_ERR_DUPLICATE;
     }
     if(avail_idx == MAX_N_BREAKPOINTS) {
         return BP_ERR_TOOMANY;
     }
     breakpoints[avail_idx].addr = line_to_addr(line);
-    breakpoints[avail_idx].exists = 1;
     enable_bp(&breakpoints[avail_idx]);
     return avail_idx;
 }
@@ -239,7 +241,7 @@ int get_bp_at_addr(void *addr) {
 void list_breakpoints() {
     for (int i = 0; i < MAX_N_BREAKPOINTS; i++) {
         if (breakpoints[i].exists) {
-            printf("%d\t%p\t%d\n", i, breakpoints[i].addr, breakpoints[i].enabled);
+            printf("%d\t%p\n", i, breakpoints[i].addr);
         }
     }
 }
@@ -320,7 +322,7 @@ void step_over_breakpoint(int *status, debug_state_t *state) {
     state->hit_bp = 0;
     void *bp_addr = (void*)(get_reg(PC_REGNAME, NULL) - 1);
     int bp_idx = get_bp_at_addr(bp_addr);
-    int must_disable_bp = (bp_idx != -1 && breakpoints[bp_idx].enabled);
+    int must_disable_bp = (bp_idx != -1 && breakpoints[bp_idx].exists);
     if (must_disable_bp) {
         disable_bp(&breakpoints[bp_idx]);
     }
@@ -471,7 +473,7 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             int reg_err;
             unsigned long long reg_val = get_reg(cmd->print_reg_info.regname, &reg_err);
             if (!reg_err) {
-                printf("Register value: %llu\n", reg_val);
+                printf("Register value: %llx\n", reg_val);
             } else {
                 printf("Error: register not found\n");
             }
@@ -496,8 +498,8 @@ static void attach_to_inferior(pid_t pid)
 {
     child_pid = pid;
     printf("Starting on PID %d\n", pid);
-    ptrace(PTRACE_SEIZE, pid, NULL, NULL);
-    ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);
+    /*ptrace(PTRACE_SEIZE, pid, NULL, NULL);
+    ptrace(PTRACE_INTERRUPT, pid, NULL, NULL);*/
 
     int status;
     debug_state_t state;
