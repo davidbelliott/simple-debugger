@@ -1,6 +1,6 @@
 CC=gcc
 CXX=g++
-CCFLAGS=-Wall -g
+CCFLAGS=-Wall -g -fno-omit-frame-pointer
 LDFLAGS=-lreadline -g
 SOURCES=$(wildcard *.c)
 OBJECTS=$(SOURCES:.c=.o)
