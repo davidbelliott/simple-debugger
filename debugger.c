@@ -21,6 +21,8 @@
 #define PARSE_MAX_N_TOKENS 16
 #define PARSE_MAX_TOKEN_LEN 256
 
+#define MAX_VAR_NAME_LEN    64
+
 #define PARSE_NO_ERROR  0
 #define PARSE_ERROR     1
 
@@ -73,14 +75,14 @@ typedef struct cmd_bp_del_info_t {
     unsigned int idx;
 } cmd_bp_del_info_t;
 
-typedef struct cmd_print_mem_info_t {
-    void *addr;
-} cmd_print_mem_info_t;
-
-typedef struct cmd_set_mem_info_t {
-    void *addr;
-    char new_value;
-} cmd_set_mem_info_t;
+typedef struct cmd_mem_info_t {
+    int is_varname;
+    unsigned long new_value;
+    union {
+        void *addr;
+        char varname[MAX_VAR_NAME_LEN];
+    };
+} cmd_mem_info_t;
 
 typedef struct cmd_print_reg_info_t {
     char regname[9];    // longest reg name is orig_rax (8 chars) + '\0'
@@ -96,8 +98,7 @@ typedef struct cmd_t {
     union {
         cmd_bp_set_info_t bp_set_info;
         cmd_bp_del_info_t bp_del_info;
-        cmd_print_mem_info_t print_mem_info;
-        cmd_set_mem_info_t set_mem_info;
+        cmd_mem_info_t mem_info;
         cmd_print_reg_info_t print_reg_info;
         cmd_set_reg_info_t set_reg_info;
     };
@@ -150,26 +151,19 @@ void tokenize(char *cmd_str, char cmd_tokens[PARSE_MAX_N_TOKENS][PARSE_MAX_TOKEN
     *n_tokens = cur_token;
 }
 
-int get_ll(const char *str, long long *num) {
+int get_ull(const char *str, unsigned long long *num) {
+    int base = 10;
+    if (strlen(str) > 2 && !strncmp(str, "0x", 2)) {
+        base = 16;
+        str += 2;
+    }
     errno = 0;
     char *end;
-    *num = strtoll(str, &end, 10);
+    *num = strtoull(str, &end, base);
     if (errno || end != str + strlen(str)) {
         return 1;
     }
     return 0;
-}
-
-int get_addr_of_var(const char *varname, void **addr) {
-    long long addr_num;
-    int err = get_ll(varname, &addr_num);
-    *addr = (void*)addr_num;
-    return err;
-}
-
-void setup_inferior(const char *path, char *const argv[]) {
-    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-    execv(path, argv);
 }
 
 void *rel_to_abs_addr(pid_t pid, void *addr) {
@@ -183,6 +177,21 @@ void *rel_to_abs_addr(pid_t pid, void *addr) {
     return (void*)(addr + offset);
 }
 
+int get_addr_of_var(char *varname, void **addr) {
+    void *rel_addr = NULL;
+    int err = dwarf4_query_global_symbol(varname, &rel_addr);
+    if (err) {
+        return err;
+    }
+    *addr = rel_to_abs_addr(child_pid, rel_addr);
+    return 0;
+}
+
+void setup_inferior(const char *path, char *const argv[]) {
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    execv(path, argv);
+}
+
 void *line_to_addr(unsigned int line, int *err) {
     void *addr;
     *err = dwarf4_query_line("hello.c", line, &addr);
@@ -191,6 +200,12 @@ void *line_to_addr(unsigned int line, int *err) {
     } else {
         return NULL;
     }
+}
+
+void *global_symbol_to_addr(char *name, int *err) {
+    void *addr;
+    *err = dwarf4_query_global_symbol(name, &addr);
+    return addr;
 }
 
 void enable_bp(bp_t *bp) {
@@ -222,7 +237,6 @@ int create_bp(unsigned int line) {
         return BP_ERR_NOLINE;
     }
     int avail_idx = -1;
-    int is_duplicate = 0;
     for(int i = 0; i < MAX_N_BREAKPOINTS; i++) {
         if(avail_idx == -1 && !breakpoints[i].exists)
             avail_idx = i;
@@ -238,7 +252,6 @@ int create_bp(unsigned int line) {
 }
 
 int get_bp_at_addr(void *addr) {
-    int n_bp = 0;
     for(int i = 0; i < MAX_N_BREAKPOINTS; i++) {
         if (breakpoints[i].exists && breakpoints[i].addr == addr) {
             return i;
@@ -355,7 +368,7 @@ void print_backtrace() {
     if (!reg_err) {
         void *ret_addr = (void*)get_mem(fp + 8);
         int i = 0;
-        for (i = 0; i < MAX_STACK_TRACE_DEPTH && fp && ret_addr < 0x700000000000; i++) {
+        for (i = 0; i < MAX_STACK_TRACE_DEPTH && fp && ret_addr < (void*)0x700000000000; i++) {
             printf("rbp: %p\tret: %p\n", fp, ret_addr);
             fp = (void*)get_mem(fp);
             ret_addr = (void*)get_mem(fp + 8);
@@ -368,7 +381,26 @@ void print_backtrace() {
     }
 }
 
-int cmd_parse(char *cmd_str, cmd_t *cmd) {
+int parse_mem_info(char cmd_tokens[PARSE_MAX_N_TOKENS][PARSE_MAX_TOKEN_LEN],
+        cmd_mem_info_t *mem_info) {
+    if (cmd_tokens[1][0] == '*') {  // address
+        mem_info->is_varname = 0;
+        unsigned long long addr_l;
+        int num_error = get_ull(&cmd_tokens[1][1], &addr_l);
+        if (num_error) {
+            fprintf(stderr, "Error: memory address is not a valid number\n");
+            return PARSE_ERROR;
+        }
+        mem_info->addr = (void*)addr_l;
+    } else {    // variable name
+        mem_info->is_varname = 1;
+        strncpy(mem_info->varname, &cmd_tokens[1][0], MAX_VAR_NAME_LEN);
+        mem_info->varname[MAX_VAR_NAME_LEN - 1] = '\0';
+    }
+    return PARSE_NO_ERROR;
+}
+
+int parse_cmd(char *cmd_str, cmd_t *cmd) {
     char cmd_tokens[PARSE_MAX_N_TOKENS][PARSE_MAX_TOKEN_LEN];
     unsigned int n_tokens;
     tokenize(cmd_str, cmd_tokens, &n_tokens);
@@ -382,8 +414,8 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
             fprintf(stderr, "Error: too few arguments to set breakpoint\n");
             return PARSE_ERROR;
         }
-        long long line_no;
-        int num_error = get_ll(cmd_tokens[1], &line_no);
+        unsigned long long line_no;
+        int num_error = get_ull(cmd_tokens[1], &line_no);
         if(num_error || line_no < 1) {
             fprintf(stderr, "Error: breakpoint line is not a valid number\n");
             return PARSE_ERROR;
@@ -395,8 +427,8 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
             fprintf(stderr, "Error: too few arguments to delete breakpoint\n");
             return PARSE_ERROR;
         }
-        long long idx;
-        int num_err = get_ll(cmd_tokens[1], &idx);
+        unsigned long long idx;
+        int num_err = get_ull(cmd_tokens[1], &idx);
         if(num_err) {
             fprintf(stderr, "Error: breakpoint index is not a valid number\n");
             return PARSE_ERROR;
@@ -414,31 +446,28 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
             fprintf(stderr, "Error: too few arguments to print memory\n");
             return PARSE_ERROR;
         }
-        int addr_error = get_addr_of_var(cmd_tokens[1],
-                &cmd->print_mem_info.addr);
-        if(addr_error) {
-            fprintf(stderr, "Error: memory address is not a valid number\n");
-            return PARSE_ERROR;
+        int parse_err = parse_mem_info(cmd_tokens, &cmd->mem_info);
+        if (parse_err) {
+            return parse_err;
         }
+        cmd->mem_info.new_value = 0;
     } else if(!strcmp(cmd_tokens[0], "s")) {
         cmd->type = CMD_SET_MEM;
         if(n_tokens < 3) {
             fprintf(stderr, "Error: too few arguments to set memory\n");
             return PARSE_ERROR;
         }
-        int addr_error = get_addr_of_var(cmd_tokens[1],
-                &cmd->set_mem_info.addr);
-        if(addr_error) {
-            fprintf(stderr, "Error: memory address is not a valid number\n");
-            return PARSE_ERROR;
+        int parse_err = parse_mem_info(cmd_tokens, &cmd->mem_info);
+        if (parse_err) {
+            return parse_err;
         }
-        long long new_value;
-        int num_err = get_ll(cmd_tokens[2], &new_value);
+        unsigned long long new_value;
+        int num_err = get_ull(cmd_tokens[2], &new_value);
         if (num_err) {
             fprintf(stderr, "Error: new value is not a valid number\n");
             return PARSE_ERROR;
         }
-        cmd->set_mem_info.new_value = (char)new_value;
+        cmd->mem_info.new_value = (unsigned long)new_value;
     } else if(!strcmp(cmd_tokens[0], "pr")) {
         cmd->type = CMD_PRINT_REG;
         if(n_tokens < 2) {
@@ -455,8 +484,8 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
         }
         memcpy(cmd->set_reg_info.regname, cmd_tokens[1], 8);
         cmd->set_reg_info.regname[8] = '\0';
-        long long new_value;
-        int num_err = get_ll(cmd_tokens[2], &new_value);
+        unsigned long long new_value;
+        int num_err = get_ull(cmd_tokens[2], &new_value);
         cmd->set_reg_info.new_value = (unsigned long long)new_value;
         if(num_err) {
             fprintf(stderr, "Error: new register value is not a valid number\n");
@@ -471,7 +500,7 @@ int cmd_parse(char *cmd_str, cmd_t *cmd) {
     return PARSE_NO_ERROR;
 }
 
-int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
+int execute_cmd(cmd_t *cmd, int *status, debug_state_t *state) {
     switch(cmd->type) {
         case CMD_BP_SET: {
             int bp_idx = create_bp(cmd->bp_set_info.line);
@@ -523,11 +552,31 @@ int cmd_execute(cmd_t *cmd, int *status, debug_state_t *state) {
             waitpid(child_pid, status, 0);
             break;
         } case CMD_PRINT_MEM: {
-            unsigned long data = get_mem(cmd->print_mem_info.addr);
+            void *addr = NULL;
+            if (cmd->mem_info.is_varname) {
+                int rc = get_addr_of_var(cmd->mem_info.varname, &addr);
+                if (rc) {
+                    fprintf(stderr, "Error: could not get address of global symbol %s\n", cmd->mem_info.varname);
+                    return EXECUTE_ERROR;
+                }
+            } else {
+                addr = cmd->mem_info.addr;
+            }
+            unsigned long data = get_mem(addr);
             printf("0x%lx\n", data);
             break;
         } case CMD_SET_MEM: {
-            ptrace(PTRACE_POKEDATA, child_pid, cmd->set_mem_info.addr, cmd->set_mem_info.new_value);
+            void *addr = NULL;
+            if (cmd->mem_info.is_varname) {
+                int rc = get_addr_of_var(cmd->mem_info.varname, &addr);
+                if (rc) {
+                    fprintf(stderr, "Error: could not get address of global symbol %s\n", cmd->mem_info.varname);
+                    return EXECUTE_ERROR;
+                }
+            } else {
+                addr = cmd->mem_info.addr;
+            }
+            ptrace(PTRACE_POKEDATA, child_pid, addr, cmd->mem_info.new_value);
             break;
         } case CMD_PRINT_REG: {
             int reg_err;
@@ -583,10 +632,10 @@ static void attach_to_inferior(pid_t pid)
             int parse_err = 0;
             int execute_err = 0;
             cmd_t cmd;
-            parse_err = cmd_parse(cmd_str, &cmd);
+            parse_err = parse_cmd(cmd_str, &cmd);
             free(cmd_str);
             if (!parse_err) {
-                execute_err = cmd_execute(&cmd, &status, &state);
+                execute_err = execute_cmd(&cmd, &status, &state);
             }
         } else if (WIFEXITED(status)) {
             printf("Inferior exited\n");
